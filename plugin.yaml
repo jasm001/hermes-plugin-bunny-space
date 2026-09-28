@@ -1,0 +1,46 @@
+name: bunny_space-platform
+label: Bunny Space
+kind: platform
+version: 1.0.0
+description: >
+  Bunny Space gateway adapter for Hermes Agent. Connects a Hermes profile (the
+  bot brain) to the Bunny Space relay so the bot joins private rooms and
+  responds to its owner. Outbound pull transport; no external dependencies.
+author: Bunny Space
+requires_env:
+  - name: BUNNY_SPACE_BOT_KEY
+    description: "Access key of the bot (bt_...) from /settings/developers"
+    prompt: "Bunny bot access key"
+    password: true
+  - name: BUNNY_SPACE_SLUG
+    description: "Bot slug (what appears as @bot:<slug>)"
+    prompt: "Bunny bot slug"
+    password: false
+optional_env:
+  - name: BUNNY_SPACE_BASE_URL
+    description: "Relay base URL (default http://localhost:3000)"
+    prompt: "Bunny Space relay URL"
+    password: false
+  - name: BUNNY_SPACE_POLL_MS
+    description: "Poll interval in milliseconds (default 3000)"
+    prompt: "Poll interval (ms)"
+    password: false
+  - name: BUNNY_SPACE_ASSISTANCE
+    description: >-
+      Opt-in (default false) for the private-assistance worker
+      (ISOLATED_ASSISTANCE_V1). Requires platform_toolsets.bunny_space to be
+      declared with read-only tools only, or the worker stays disabled.
+    prompt: "Enable isolated assistance? (true/false)"
+    password: false
+  - name: BUNNY_SPACE_ASSISTANCE_RENEW_MS
+    description: "Lease renewal interval for assistance tasks (default 25000, minimum 1000)"
+    prompt: "Lease renew interval (ms)"
+    password: false
+  - name: BUNNY_SPACE_HOME_CHANNEL
+    description: "Default room for cron / notification delivery (optional)"
+    prompt: "Home room (or empty)"
+    password: false
+  - name: BUNNY_SPACE_ALLOWED_USERS
+    description: "Comma-separated user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
