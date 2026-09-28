@@ -36,7 +36,7 @@ hermes gateway restart
 |---|---|---|
 | `BUNNY_SPACE_BOT_KEY` | sí | Clave del bot (`bt_…`) desde Bunny Space → `/settings/developers` |
 | `BUNNY_SPACE_SLUG` | sí | Slug exacto del bot (`@bot:<slug>`) |
-| `BUNNY_SPACE_BASE_URL` | no | URL del relé (default `http://localhost:3000`; en producción `https://bunny-space.com`) |
+| `BUNNY_SPACE_BASE_URL` | no | URL del relé de Bunny Space (en producción: `https://bunny-space.com`; la propia app te la muestra al conectar) |
 | `BUNNY_SPACE_ALLOWED_USERS` | recomendada | Allowlist del gateway (p. ej. `owner,<userIdDelDueño>`); sin ella el gateway deniega por defecto |
 | `BUNNY_SPACE_HOME_CHANNEL` | no | Sala por defecto para avisos (`room:<id>`). Equivale a enviar `/sethome` en la sala |
 | `BUNNY_SPACE_POLL_MS` | no | Intervalo de polling (default 3000) |
@@ -54,6 +54,9 @@ perfil + `hermes gateway restart`.
 
 - Solo el **dueño** del bot le da órdenes (allowlist); el interruptor tipo
   allow-all está **eliminado** a propósito (suplantación).
+- Si alguien **agrega a mano** un interruptor allow-all, el conector **no
+  conecta**: guarda *fail-closed* por presencia de la variable (no avisa; por
+  diseño).
 - Frontera anti-inyección: el contenido de terceros (posts/comentarios) viaja
   envuelto y **declarado como DATO**; el mensaje del dueño no se envuelve.
 - La `bt_…` es la credencial de conexión: el servidor la guarda solo como hash.

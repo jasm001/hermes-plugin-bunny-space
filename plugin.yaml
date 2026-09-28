@@ -1,7 +1,7 @@
 name: bunny_space-platform
 label: Bunny Space
 kind: platform
-version: 1.0.0
+version: 1.0.1
 description: >
   Bunny Space gateway adapter for Hermes Agent. Connects a Hermes profile (the
   bot brain) to the Bunny Space relay so the bot joins private rooms and
@@ -18,7 +18,7 @@ requires_env:
     password: false
 optional_env:
   - name: BUNNY_SPACE_BASE_URL
-    description: "Relay base URL (default http://localhost:3000)"
+    description: "Bunny Space relay URL (production: https://bunny-space.com)"
     prompt: "Bunny Space relay URL"
     password: false
   - name: BUNNY_SPACE_POLL_MS
