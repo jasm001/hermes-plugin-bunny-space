@@ -4,8 +4,9 @@ Connects a Hermes profile (the bot brain) to the Bunny Space relay
 (``/api/bot/v1/*``) so a Bunny bot appears in rooms and responds to the owner.
 
 Transport: OUTBOUND / PULL. The gateway polls the relay for new room messages,
-``@bot`` tasks and — when explicitly enabled — private assistance tasks
-(``ISOLATED_ASSISTANCE_V1``). It dispatches them to the agent (which runs the
+``@bot`` tasks and — when the relay session declares the capability
+(``ISOLATED_ASSISTANCE_V1``, activated by default for the bot) — private
+assistance tasks. It dispatches them to the agent (which runs the
 brain as this profile) and sends the response back through the relay.
 
 Configuration (config.yaml ``gateway.platforms.bunny_space.extra`` or env):
@@ -14,7 +15,9 @@ Configuration (config.yaml ``gateway.platforms.bunny_space.extra`` or env):
     BUNNY_SPACE_BOT_KEY    the bot's access key (``bt_...`` from /settings/developers)
     BUNNY_SPACE_SLUG       the bot slug (``@bot:<slug>``)
     BUNNY_SPACE_POLL_MS    poll interval (default 3000)
-    BUNNY_SPACE_ASSISTANCE opt-in (default false) for the private-assistance worker
+    BUNNY_SPACE_ASSISTANCE override del DUEÑO del perfil (0/1) del trabajador de
+                           asistencia privada; AUSENTE = decide el relé
+                           (capability declarada por defecto) — nunca desactiva
     BUNNY_SPACE_ASSISTANCE_RENEW_MS lease renewal interval (default 25000)
 
 Isolation (F0.2): the assistance worker refuses to claim tasks unless the
@@ -34,7 +37,6 @@ No external dependencies beyond the stdlib (urllib via asyncio.to_thread).
 """
 
 import asyncio
-import hmac
 import json
 import logging
 import os
@@ -71,6 +73,12 @@ from gateway.config import Platform
 
 #: Capability announced on the relay claim; the relay answers 426 without it.
 ASSISTANCE_CAPABILITY = "ISOLATED_ASSISTANCE_V1"
+
+#: Contrato de SESIÓN que el relé sirve en ``GET /api/bot/v1/session`` (carril
+#: `asistencia-auto-provision`): de ahí sale la capability de arriba ACTIVADA POR
+#: DEFECTO y el slug canónico. Un relé sin el endpoint (404/405) conserva el
+#: comportamiento por ``.env``.
+PROVISION_CONTRACT_VERSION = "BOT_PROVISION_V1"
 
 # El borde de Cloudflare de bunny-space.com bloquea con HTTP 403 (error 1010)
 # el User-Agent por defecto de urllib; el conector se identifica con el suyo.
@@ -226,6 +234,38 @@ def _truthy(value: Any) -> bool:
     return False
 
 
+#: Valores que cuentan como "sí" / "no" en el override del dueño.
+_ASSISTANCE_ON = {"1", "true", "yes", "on", "si", "sí", "enabled"}
+_ASSISTANCE_OFF = {"0", "false", "no", "off", "disabled"}
+
+
+def _parse_assistance_override(raw: Any) -> Optional[bool]:
+    """Override del DUEÑO del perfil para el trabajador de asistencia.
+
+    ``None`` = sin preferencia: decide el RELÉ (la capability llega declarada en
+    la sesión y el ayudante se activa solo, sin setup). ``0``/``false`` lo apaga
+    y ``1``/``true`` lo fuerza. Un valor ilegible se trata como OFF (fail-closed,
+    como el opt-in viejo): solo la AUSENCIA delega en la sesión.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return raw != 0
+    text = str(raw).strip().lower()
+    if text == "":
+        return None
+    if text in _ASSISTANCE_ON:
+        return True
+    if text in _ASSISTANCE_OFF:
+        return False
+    logger.warning(
+        "BUNNY_SPACE: BUNNY_SPACE_ASSISTANCE=%r no es 0/1; se trata como 0 (fail-closed)", raw
+    )
+    return False
+
+
 def load_active_profile_config() -> Dict[str, Any]:
     """Read the ACTIVE profile ``config.yaml`` exactly as written.
 
@@ -371,8 +411,19 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         # tarea PENDING en cada poll (causaba el "↪ Redirected current run").
         self._inflight_tasks: set[str] = set()
 
-        # Asistencia privada: opt-in + puerta de aislamiento evaluada al conectar.
-        self.assistance_requested = _truthy(_get_scoped_secret("BUNNY_SPACE_ASSISTANCE") or extra.get("assistance", False))
+        # Asistencia privada: la capability la declara el RELÉ en su sesión
+        # (`GET /api/bot/v1/session`, activada por defecto) y se aplica al
+        # conectar; `BUNNY_SPACE_ASSISTANCE` es SOLO override explícito del
+        # dueño del perfil (0 apaga / 1 fuerza) — su AUSENCIA no desactiva nada.
+        # La puerta de aislamiento (F0.2) se evalúa igual y sigue siendo la que
+        # decide; esto solo resuelve si el trabajador se considera solicitado.
+        self.assistance_override = _parse_assistance_override(
+            _get_scoped_secret("BUNNY_SPACE_ASSISTANCE") or extra.get("assistance")
+        )
+        self.session_assistance_capable = False
+        self.session_reason = "sesión del relé no leída"
+        self.provision_digest = ""
+        self.assistance_requested = False  # se resuelve tras leer la sesión
         self.assistance_enabled = False
         self.assistance_reason = "no evaluada"
         try:
@@ -402,8 +453,16 @@ class BunnySpaceAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if _blocked_config_present():
             return False
+        # Sesión del relé ANTES de validar (carril `asistencia-auto-provision`):
+        # es la única fuente de provisión y de ahí sale el slug canónico, así que
+        # se lee primero para que un perfil con solo la key adopte el slug real.
+        # Sin endpoint (relé viejo ⇒ 404/405) se conserva el comportamiento env.
+        await self._load_session()
         if not self.base_url or not self.bot_key or not self.slug:
-            logger.error("BUNNY_SPACE: base_url / bot_key / slug must be configured")
+            logger.error(
+                "BUNNY_SPACE: base_url / bot_key / slug must be configured "
+                "(o el relé debe servir GET /api/bot/v1/session con `bot.slug`)"
+            )
             self._set_fatal_error(
                 "config_missing",
                 "BUNNY_SPACE_BASE_URL, BUNNY_SPACE_BOT_KEY and BUNNY_SPACE_SLUG must be set",
@@ -436,11 +495,71 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 pass
         self._poll_task = None
 
+    async def _load_session(self) -> None:
+        """Lee `GET /api/bot/v1/session` y aplica la provisión al conectar.
+
+        Fuente única de la configuración del conector (el dueño NO edita el
+        `.env`): hoy adopta el slug CANÓNICO y la capability de asistencia
+        privada (`ISOLATED_ASSISTANCE_V1`, que el relé declara activada por
+        defecto, de modo que el ayudante del taller se activa solo).
+
+        Fail-closed hacia el pasado: si el relé no sirve el endpoint (404/405),
+        o el contrato no es `BOT_PROVISION_V1`, o un campo viene mal formado, se
+        CONSERVA el comportamiento por `.env` — nunca se adivina.
+        """
+        data = await self._relay_json("GET", "/api/bot/v1/session")
+        if not isinstance(data, dict) or data.get("error"):
+            error = data.get("error") if isinstance(data, dict) else None
+            self.session_reason = f"sin sesión del relé ({error or 'respuesta ilegible'}); se conserva el .env"
+            logger.info("BUNNY_SPACE: %s", self.session_reason)
+            return
+        if data.get("contractVersion") != PROVISION_CONTRACT_VERSION:
+            self.session_reason = (
+                f"contrato de sesión no reconocido ({data.get('contractVersion')!r}); "
+                "se conserva el .env"
+            )
+            logger.warning("BUNNY_SPACE: %s", self.session_reason)
+            return
+        bot = data.get("bot")
+        if isinstance(bot, dict):
+            canonical = (bot.get("slug") or "").strip()
+            if canonical and canonical != self.slug:
+                logger.info(
+                    "BUNNY_SPACE: slug del .env %r → canónico %r (sesión del relé)",
+                    self.slug,
+                    canonical,
+                )
+                self.slug = canonical
+        capabilities = data.get("capabilities")
+        if isinstance(capabilities, list):
+            self.session_assistance_capable = ASSISTANCE_CAPABILITY in [
+                str(entry).strip() for entry in capabilities
+            ]
+        digest = data.get("provisionDigest")
+        if isinstance(digest, str) and digest:
+            self.provision_digest = digest
+        self.session_reason = (
+            f"capability {ASSISTANCE_CAPABILITY} declarada por el relé"
+            if self.session_assistance_capable
+            else "el relé no declaró la capability de asistencia"
+        )
+
     def _evaluate_assistance(self) -> None:
         """Enable the assistance worker only for a provably isolated runtime."""
+        if self.assistance_override is None:
+            # Sin preferencia del dueño decide la SESIÓN del relé: la capability
+            # llega declarada por defecto ⇒ el ayudante se activa solo.
+            self.assistance_requested = self.session_assistance_capable
+        else:
+            self.assistance_requested = self.assistance_override
         if not self.assistance_requested:
             self.assistance_enabled = False
-            self.assistance_reason = "deshabilitada (BUNNY_SPACE_ASSISTANCE sin activar)"
+            if self.assistance_override is False:
+                self.assistance_reason = (
+                    "deshabilitada (override del dueño: BUNNY_SPACE_ASSISTANCE=0)"
+                )
+            else:
+                self.assistance_reason = f"deshabilitada ({self.session_reason})"
             return
         try:
             config = load_active_profile_config()
@@ -836,7 +955,6 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                     "POST",
                     "/api/bot/v1/update",
                     body={"taskId": task_id, "output": content},
-                    sign=True,
                 )
                 if ok is not None and not (isinstance(ok, dict) and ok.get("error")):
                     self._inflight_tasks.discard(task_id)
@@ -858,8 +976,8 @@ class BunnySpaceAdapter(BasePlatformAdapter):
     # El rele actualiza BotProfile.status/updatedAt con {botProfileId, status}.
     # Sin este ping la ficha del bot dice "Sin conectar"/"desconectado" aunque
     # el conector este vivo: la senal de presencia se lee del updatedAt del
-    # perfil (bot-connection-state.ts). Se envia cada ~45 s con la misma firma
-    # que /update y jamas corta el poll si falla.
+    # perfil (bot-connection-state.ts). Se envia cada ~45 s y jamas corta el
+    # poll si falla.
     async def _heartbeat_tick(self) -> None:
         now = time.monotonic()
         if now - getattr(self, "_last_heartbeat_at", 0.0) < 45.0:
@@ -878,7 +996,6 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             "POST",
             "/api/bot/v1/heartbeat",
             {"botProfileId": bot_id, "status": "AWAKE"},
-            sign=True,
         )
         if isinstance(result, dict) and result.get("error"):
             logger.warning("BUNNY_SPACE: heartbeat fallo: %s", result.get("error"))
@@ -896,10 +1013,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
 
     # ── Relay HTTP helpers ────────────────────────────────────────────────
 
-    def _sign(self, body: str) -> str:
-        return hmac.new(self.bot_key.encode(), body.encode(), "sha256").hexdigest()
-
-    async def _relay_json(self, method: str, path: str, body: Optional[dict] = None, sign: bool = False):
+    async def _relay_json(self, method: str, path: str, body: Optional[dict] = None):
         def _decode(raw: str):
             try:
                 return json.loads(raw) if raw else {}
@@ -919,8 +1033,6 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             if body is not None:
                 data = json.dumps(body).encode("utf-8")
                 headers["content-type"] = "application/json"
-                if sign:
-                    headers["x-bot-signature"] = self._sign(data.decode("utf-8"))
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=15) as resp:

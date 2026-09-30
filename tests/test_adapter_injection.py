@@ -220,7 +220,7 @@ class TaskDispatchBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def _adapter(self, *, tasks, messages, isolation=True):
         adapter = make_adapter(profile_config={"platform_toolsets": {"bunny_space": ["vision"]}}, isolation=isolation)
 
-        async def fake_relay_json(method, path, body=None, sign=False):
+        async def fake_relay_json(method, path, body=None):
             if path.startswith("/api/bot/v1/rooms/messages"):
                 return {"messages": messages}
             if path.startswith("/api/bot/v1/tasks"):

@@ -1,7 +1,7 @@
 name: bunny_space-platform
 label: Bunny Space
 kind: platform
-version: 1.0.1
+version: 1.0.2
 description: >
   Bunny Space gateway adapter for Hermes Agent. Connects a Hermes profile (the
   bot brain) to the Bunny Space relay so the bot joins private rooms and
@@ -27,10 +27,12 @@ optional_env:
     password: false
   - name: BUNNY_SPACE_ASSISTANCE
     description: >-
-      Opt-in (default false) for the private-assistance worker
-      (ISOLATED_ASSISTANCE_V1). Requires platform_toolsets.bunny_space to be
-      declared with read-only tools only, or the worker stays disabled.
-    prompt: "Enable isolated assistance? (true/false)"
+      Override del DUEÑO del perfil (0/1) para el trabajador de asistencia
+      privada (ISOLATED_ASSISTANCE_V1). Ausente = decide el relé: la capability
+      llega declarada por defecto y el ayudante se activa solo al conectar.
+      Requiere platform_toolsets.bunny_space declarado con herramientas de solo
+      lectura, o el trabajador queda apagado (fail-closed).
+    prompt: "Override del asistente? (0/1, vacío = automático)"
     password: false
   - name: BUNNY_SPACE_ASSISTANCE_RENEW_MS
     description: "Lease renewal interval for assistance tasks (default 25000, minimum 1000)"
