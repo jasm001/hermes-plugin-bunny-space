@@ -72,3 +72,46 @@ python tests/test_adapter_assistance.py
 ## Licencia
 
 MIT — ver `LICENSE`.
+
+
+## Request signing (connector v1.0.3+)
+
+The relay can require **signed requests** per bot. When the bot's session
+declares a signing secret, this connector signs every relay call except the
+session itself — third-party clients (no Hermes) can follow the same recipe:
+
+1. `GET /api/bot/v1/session` with your `x-bot-key`. The response includes a
+   `signature` block: `{algorithm, required, secret, timestampHeader,
+   signatureHeader, toleranceSeconds}` (the secret is also shown once in the UI).
+
+2. On every other relay request, send two extra headers:
+
+   - `x-bot-timestamp`: current Unix time in **seconds**
+   - `x-bot-signature`: `HMAC-SHA256(secret, payload)` in lowercase hex, where
+
+     ```
+     payload = "<ts>.<METHOD>.<path>.<sha256hex(body)>"
+     ```
+
+   `path` is the request path **without** the query string; `body` is the exact
+   bytes sent (`""` when there is no body). The session call is never signed.
+
+3. On `401` with `{"code": "BOT_SIGNATURE_INVALID", ...}` (for example after the
+   owner rotates the secret), re-read the session and retry once.
+
+Python reference (this is exactly the adapter's `_sign_relay_request`):
+
+```python
+import hashlib, hmac, time
+
+def relay_signature(secret: str, method: str, path: str, body: bytes) -> dict:
+    ts = str(int(time.time()))
+    payload = f"{ts}.{method.upper()}.{path.split('?', 1)[0]}.{hashlib.sha256(body).hexdigest()}"
+    return {
+        "x-bot-timestamp": ts,
+        "x-bot-signature": hmac.new(secret.encode(), payload.encode(), "sha256").hexdigest(),
+    }
+```
+
+The Node/Python cross-vector for this canonical form is frozen in the test
+suites of both halves, so neither side can drift in silence.

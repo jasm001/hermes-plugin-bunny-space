@@ -33,10 +33,18 @@ This connector verifies that declaration and requires the same isolated tool
 surface before dispatching ANY third-party content — the boundary must not
 depend on a prompt promise. An undeclared payload is wrapped whole as data.
 
+Request signing (v1.0.3, relé `firma-relay-exigida`): when the relay delivers a
+signing secret in the session, every relay call EXCEPT the session itself is
+signed with ``x-bot-timestamp`` + ``x-bot-signature`` (HMAC-SHA256 over
+``ts.method.path.sha256hex(body)``, path without query). A rejected signature
+re-reads the session once (rotation recovery). The secret never gets logged.
+
 No external dependencies beyond the stdlib (urllib via asyncio.to_thread).
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -79,6 +87,13 @@ ASSISTANCE_CAPABILITY = "ISOLATED_ASSISTANCE_V1"
 #: DEFECTO y el slug canónico. Un relé sin el endpoint (404/405) conserva el
 #: comportamiento por ``.env``.
 PROVISION_CONTRACT_VERSION = "BOT_PROVISION_V1"
+
+#: Firma del relé (carril `firma-relay-exigida`): el secreto (`bs_...`) llega
+#: por la sesión y NUNCA se loguea; estas cabeceras acompañan a cada petición
+#: firmada (salvo la propia sesión).
+SIGNATURE_TIMESTAMP_HEADER = "x-bot-timestamp"
+SIGNATURE_HEADER = "x-bot-signature"
+SIGNATURE_ALGORITHM = "hmac-sha256"
 
 # El borde de Cloudflare de bunny-space.com bloquea con HTTP 403 (error 1010)
 # el User-Agent por defecto de urllib; el conector se identifica con el suyo.
@@ -266,6 +281,28 @@ def _parse_assistance_override(raw: Any) -> Optional[bool]:
     return False
 
 
+def _sign_relay_request(
+    secret: str,
+    method: str,
+    path: str,
+    body: bytes,
+    timestamp: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Firma canónica del relé (espejo de ``bot-request-signature.ts``).
+
+    ``ts.method.path.sha256hex(body)`` firmado con HMAC-SHA256(secreto) en hex.
+    El ``path`` va SIN query string (el relé firma el pathname) y el método se
+    normaliza a MAYÚSCULAS. Congelado por un vector cruzado Node/Python en las
+    pruebas (``tests/bot-request-signature.test.ts`` / ``test_adapter_signing.py``).
+    """
+    ts = timestamp or str(int(time.time()))
+    path_only = path.split("?", 1)[0]
+    body_hash = hashlib.sha256(body if body is not None else b"").hexdigest()
+    payload = f"{ts}.{method.upper()}.{path_only}.{body_hash}"
+    signature = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), "sha256").hexdigest()
+    return ts, signature
+
+
 def load_active_profile_config() -> Dict[str, Any]:
     """Read the ACTIVE profile ``config.yaml`` exactly as written.
 
@@ -424,6 +461,10 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         self.session_reason = "sesión del relé no leída"
         self.provision_digest = ""
         self.assistance_requested = False  # se resuelve tras leer la sesión
+        self.signature_secret: Optional[str] = None
+        self.signature_required = False
+        self.signature_timestamp_header = SIGNATURE_TIMESTAMP_HEADER
+        self.signature_header = SIGNATURE_HEADER
         self.assistance_enabled = False
         self.assistance_reason = "no evaluada"
         try:
@@ -538,6 +579,32 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         digest = data.get("provisionDigest")
         if isinstance(digest, str) and digest:
             self.provision_digest = digest
+        # La sesión es la fuente del secreto de firma: se re-sincroniza SIEMPRE
+        # (si el dueño rotó o quitó el secreto, el conector se entera aquí).
+        self.signature_secret = None
+        self.signature_required = False
+        signature = data.get("signature")
+        if isinstance(signature, dict):
+            algorithm = str(signature.get("algorithm") or "")
+            secret = signature.get("secret")
+            if algorithm and algorithm != SIGNATURE_ALGORITHM:
+                logger.warning(
+                    "BUNNY_SPACE: algoritmo de firma %r desconocido; se ignora el bloque",
+                    algorithm,
+                )
+            elif isinstance(secret, str) and secret:
+                self.signature_secret = secret
+                self.signature_required = bool(signature.get("required"))
+                ts_header = signature.get("timestampHeader")
+                sig_header = signature.get("signatureHeader")
+                if isinstance(ts_header, str) and ts_header:
+                    self.signature_timestamp_header = ts_header
+                if isinstance(sig_header, str) and sig_header:
+                    self.signature_header = sig_header
+                logger.info(
+                    "BUNNY_SPACE: firma del relé adoptada (required=%s)",
+                    self.signature_required,
+                )
         self.session_reason = (
             f"capability {ASSISTANCE_CAPABILITY} declarada por el relé"
             if self.session_assistance_capable
@@ -1033,6 +1100,18 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             if body is not None:
                 data = json.dumps(body).encode("utf-8")
                 headers["content-type"] = "application/json"
+            if (
+                self.signature_secret
+                and path.split("?", 1)[0] != "/api/bot/v1/session"
+            ):
+                # La sesión NUNCA se firma: es la puerta de (re)provisión — el
+                # relé acepta su ausencia siempre, y firmarla con un secreto
+                # viejo dejaría al conector fuera de su propia recuperación.
+                ts, signature = _sign_relay_request(
+                    self.signature_secret, method, path, data if data is not None else b""
+                )
+                headers[self.signature_timestamp_header] = ts
+                headers[self.signature_header] = signature
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1050,7 +1129,22 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                     return parsed
                 return {"error": f"HTTP {exc.code}"}
         try:
-            return await asyncio.to_thread(_req)
+            result = await asyncio.to_thread(_req)
+            if (
+                isinstance(result, dict)
+                and result.get("code") == "BOT_SIGNATURE_INVALID"
+                and path.split("?", 1)[0] != "/api/bot/v1/session"
+            ):
+                # Firma rechazada (rotación del dueño, reloj movido, secreto
+                # viejo): se re-lee la sesión —esa llamada no se firma— y se
+                # reintenta UNA vez; nunca en bucle.
+                logger.warning(
+                    "BUNNY_SPACE: firma rechazada por el relé (%s); re-leyendo la sesión",
+                    result.get("reason"),
+                )
+                await self._load_session()
+                result = await asyncio.to_thread(_req)
+            return result
         except Exception as e:
             logger.warning("BUNNY_SPACE: relay %s %s failed: %s", method, path, e)
             return {"error": str(e)}
