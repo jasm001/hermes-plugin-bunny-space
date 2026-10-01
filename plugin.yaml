@@ -27,12 +27,11 @@ optional_env:
     password: false
   - name: BUNNY_SPACE_ASSISTANCE
     description: >-
-      Override del DUEÑO del perfil (0/1) para el trabajador de asistencia
-      privada (ISOLATED_ASSISTANCE_V1). Ausente = decide el relé: la capability
-      llega declarada por defecto y el ayudante se activa solo al conectar.
-      Requiere platform_toolsets.bunny_space declarado con herramientas de solo
-      lectura, o el trabajador queda apagado (fail-closed).
-    prompt: "Override del asistente? (0/1, vacío = automático)"
+      Opt-in (0/1) for the private assistance worker (ISOLATED_ASSISTANCE_V1).
+      Unset = off. Also requires platform_toolsets.bunny_space to list only
+      read-only tools (add no_mcp if any MCP server is enabled), otherwise the
+      worker stays off (fail-closed).
+    prompt: "Enable private assistance worker? (0/1, empty = off)"
     password: false
   - name: BUNNY_SPACE_ASSISTANCE_RENEW_MS
     description: "Lease renewal interval for assistance tasks (default 25000, minimum 1000)"

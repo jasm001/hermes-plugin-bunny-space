@@ -267,6 +267,17 @@ class IsolationGateTests(unittest.TestCase):
         allowed, _ = evaluate_assistance_isolation({"platform_toolsets": {"bunny_space": ["no-such-toolset"]}})
         self.assertFalse(allowed)
 
+    def test_enabled_mcp_server_denies_unless_no_mcp(self):
+        # Hermes adds every enabled MCP server to the platform's real toolset.
+        mcp = {"mcp_servers": {"fs": {"command": "npx", "args": ["fs-server"]}}}
+        allowed, reason = evaluate_assistance_isolation({"platform_toolsets": {"bunny_space": ["vision"]}, **mcp})
+        self.assertFalse(allowed, reason)
+        self.assertIn("fs", reason)
+        allowed, reason = evaluate_assistance_isolation(
+            {"platform_toolsets": {"bunny_space": ["vision", "no_mcp"]}, **mcp}
+        )
+        self.assertTrue(allowed, reason)
+
     def test_extract_json_object_tolerates_fences(self):
         payload = extract_json_object('```json\n{"explanation": "x", "tokens": {"a-b": "red"}}\n```')
         self.assertEqual(payload, {"explanation": "x", "tokens": {"a-b": "red"}})
@@ -312,6 +323,15 @@ class AssistanceWorkerTests(unittest.IsolatedAsyncioTestCase):
         adapter = self._adapter(assistance=False, profile_config={"platform_toolsets": {"bunny_space": []}})
         adapter._evaluate_assistance()
         self.assertFalse(adapter.assistance_enabled)
+        await adapter._poll_once()
+        self.assertEqual(self.relay.claims, 0)
+
+    async def test_relay_capability_alone_does_not_enable_worker(self):
+        adapter = self._adapter(profile_config={"platform_toolsets": {"bunny_space": []}})
+        adapter.assistance_override = None  # BUNNY_SPACE_ASSISTANCE unset
+        adapter.session_assistance_capable = True  # relay declares the capability
+        adapter._evaluate_assistance()
+        self.assertFalse(adapter.assistance_enabled, "Assistance must stay opt-in for the profile owner")
         await adapter._poll_once()
         self.assertEqual(self.relay.claims, 0)
 

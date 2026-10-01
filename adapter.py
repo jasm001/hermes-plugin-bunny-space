@@ -4,8 +4,8 @@ Connects a Hermes profile (the bot brain) to the Bunny Space relay
 (``/api/bot/v1/*``) so a Bunny bot appears in rooms and responds to the owner.
 
 Transport: OUTBOUND / PULL. The gateway polls the relay for new room messages,
-``@bot`` tasks and — when the relay session declares the capability
-(``ISOLATED_ASSISTANCE_V1``, activated by default for the bot) — private
+``@bot`` tasks and — when the profile owner opts in with
+``BUNNY_SPACE_ASSISTANCE=1`` (``ISOLATED_ASSISTANCE_V1``) — private
 assistance tasks. It dispatches them to the agent (which runs the
 brain as this profile) and sends the response back through the relay.
 
@@ -15,9 +15,8 @@ Configuration (config.yaml ``gateway.platforms.bunny_space.extra`` or env):
     BUNNY_SPACE_BOT_KEY    the bot's access key (``bt_...`` from /settings/developers)
     BUNNY_SPACE_SLUG       the bot slug (``@bot:<slug>``)
     BUNNY_SPACE_POLL_MS    poll interval (default 3000)
-    BUNNY_SPACE_ASSISTANCE override del DUEÑO del perfil (0/1) del trabajador de
-                           asistencia privada; AUSENTE = decide el relé
-                           (capability declarada por defecto) — nunca desactiva
+    BUNNY_SPACE_ASSISTANCE opt-in (0/1) for the private assistance worker;
+                           unset = off (the relay cannot turn it on)
     BUNNY_SPACE_ASSISTANCE_RENEW_MS lease renewal interval (default 25000)
 
 Isolation (F0.2): the assistance worker refuses to claim tasks unless the
@@ -257,10 +256,9 @@ _ASSISTANCE_OFF = {"0", "false", "no", "off", "disabled"}
 def _parse_assistance_override(raw: Any) -> Optional[bool]:
     """Override del DUEÑO del perfil para el trabajador de asistencia.
 
-    ``None`` = sin preferencia: decide el RELÉ (la capability llega declarada en
-    la sesión y el ayudante se activa solo, sin setup). ``0``/``false`` lo apaga
-    y ``1``/``true`` lo fuerza. Un valor ilegible se trata como OFF (fail-closed,
-    como el opt-in viejo): solo la AUSENCIA delega en la sesión.
+    ``None`` = sin preferencia: el trabajador queda APAGADO (opt-in; el relé no
+    puede encenderlo). ``0``/``false`` lo apaga
+    y ``1``/``true`` lo enciende. Un valor ilegible se trata como OFF (fail-closed).
     """
     if raw is None:
         return None
@@ -337,15 +335,19 @@ def _evaluate_isolation(
     if not isinstance(raw, list):
         return False, f"`platform_toolsets.{platform}` no está declarado como lista explícita"
 
-    names = [str(name) for name in raw if str(name).strip()]
+    # Check the toolset the agent REALLY gets on this platform, not just the
+    # declared names: Hermes adds every enabled MCP server (unless `no_mcp` is
+    # listed), plugin toolsets and the context engine on top of the list.
+    try:
+        from hermes_cli.tools_config import _get_platform_tools
+        from toolsets import resolve_toolset
+
+        names = sorted(_get_platform_tools(config, platform))
+    except Exception:  # noqa: BLE001 — cannot prove isolation without the resolver
+        return False, "no se pudo resolver el toolset efectivo de la plataforma"
     if not names:
         # Explicit empty list == no tools at all for this platform (most isolated).
         return True, "sin herramientas declaradas para esta plataforma"
-
-    try:
-        from toolsets import resolve_toolset
-    except Exception:  # noqa: BLE001 — cannot prove isolation without the resolver
-        return False, "no se pudo resolver el toolset declarado"
 
     resolved: set = set()
     for name in names:
@@ -354,7 +356,10 @@ def _evaluate_isolation(
         except Exception:  # noqa: BLE001
             return False, f"el toolset `{name}` no se pudo resolver"
         if not tools:
-            return False, f"el toolset `{name}` no resuelve a ninguna herramienta conocida"
+            return False, (
+                f"el toolset `{name}` no resuelve a ninguna herramienta conocida "
+                "(¿servidor MCP? añade `no_mcp` a la lista)"
+            )
         resolved.update(tools)
 
     outside = sorted(resolved - allowed)
@@ -448,10 +453,9 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         # tarea PENDING en cada poll (causaba el "↪ Redirected current run").
         self._inflight_tasks: set[str] = set()
 
-        # Asistencia privada: la capability la declara el RELÉ en su sesión
-        # (`GET /api/bot/v1/session`, activada por defecto) y se aplica al
-        # conectar; `BUNNY_SPACE_ASSISTANCE` es SOLO override explícito del
-        # dueño del perfil (0 apaga / 1 fuerza) — su AUSENCIA no desactiva nada.
+        # Asistencia privada: opt-in del dueño del perfil. `BUNNY_SPACE_ASSISTANCE=1`
+        # la enciende; ausente o 0 = apagada, aunque el relé declare la
+        # capability en su sesión (`GET /api/bot/v1/session`).
         # La puerta de aislamiento (F0.2) se evalúa igual y sigue siendo la que
         # decide; esto solo resuelve si el trabajador se considera solicitado.
         self.assistance_override = _parse_assistance_override(
@@ -613,12 +617,9 @@ class BunnySpaceAdapter(BasePlatformAdapter):
 
     def _evaluate_assistance(self) -> None:
         """Enable the assistance worker only for a provably isolated runtime."""
-        if self.assistance_override is None:
-            # Sin preferencia del dueño decide la SESIÓN del relé: la capability
-            # llega declarada por defecto ⇒ el ayudante se activa solo.
-            self.assistance_requested = self.session_assistance_capable
-        else:
-            self.assistance_requested = self.assistance_override
+        # Opt-in del DUEÑO: que el relé declare la capability en su sesión no
+        # basta para encender el trabajador; hace falta BUNNY_SPACE_ASSISTANCE=1.
+        self.assistance_requested = self.assistance_override is True
         if not self.assistance_requested:
             self.assistance_enabled = False
             if self.assistance_override is False:
@@ -626,7 +627,9 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                     "deshabilitada (override del dueño: BUNNY_SPACE_ASSISTANCE=0)"
                 )
             else:
-                self.assistance_reason = f"deshabilitada ({self.session_reason})"
+                self.assistance_reason = (
+                    f"deshabilitada (opt-in: BUNNY_SPACE_ASSISTANCE=1; {self.session_reason})"
+                )
             return
         try:
             config = load_active_profile_config()
