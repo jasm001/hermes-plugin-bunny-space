@@ -1052,7 +1052,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         bot_id = getattr(self, "bot_profile_id", None)
         if not bot_id:
             # /session devuelve `bot.id` (el pull de /tasks no lo incluye).
-            await self._learn_bot_profile_id(
+            self._learn_bot_profile_id(
                 await self._relay_json("GET", "/api/bot/v1/session")
             )
             bot_id = getattr(self, "bot_profile_id", None)
@@ -1137,13 +1137,18 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             ):
                 # Firma rechazada (rotación del dueño, reloj movido, secreto
                 # viejo): se re-lee la sesión —esa llamada no se firma— y se
-                # reintenta UNA vez; nunca en bucle.
-                logger.warning(
-                    "BUNNY_SPACE: firma rechazada por el relé (%s); re-leyendo la sesión",
-                    result.get("reason"),
-                )
-                await self._load_session()
-                result = await asyncio.to_thread(_req)
+                # reintenta UNA vez; nunca en bucle. Como máximo una recuperación
+                # cada 30 s (sin secreto aún puede haber un 401 por llamada: no
+                # se martillea la sesión ni el log).
+                now_mono = time.monotonic()
+                if now_mono - getattr(self, "_last_signature_recovery", 0.0) >= 30.0:
+                    self._last_signature_recovery = now_mono
+                    logger.warning(
+                        "BUNNY_SPACE: firma rechazada por el relé (%s); re-leyendo la sesión",
+                        result.get("reason"),
+                    )
+                    await self._load_session()
+                    result = await asyncio.to_thread(_req)
             return result
         except Exception as e:
             logger.warning("BUNNY_SPACE: relay %s %s failed: %s", method, path, e)
