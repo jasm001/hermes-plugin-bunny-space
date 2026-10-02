@@ -67,6 +67,7 @@ class FakeRelay:
     def __init__(self):
         self.claim: dict | None = None
         self.claims = 0
+        self.session_gets = 0
         self.renews: list[dict] = []
         self.submits: list[dict] = []
         self.renew_error: str | None = None
@@ -109,6 +110,9 @@ class FakeRelay:
                     return self._json(200, {"messages": []})
                 if self.path.startswith("/api/bot/v1/tasks"):
                     return self._json(200, {"tasks": []})
+                if self.path.startswith("/api/bot/v1/session"):
+                    relay.session_gets += 1
+                    return self._json(404, {"error": "not found"})
                 if self.path.startswith("/api/bot/v1/assistance/tasks"):
                     capabilities = (self.headers.get("x-bot-capabilities") or "").split(",")
                     if ASSISTANCE_CAPABILITY not in [c.strip() for c in capabilities]:
@@ -453,3 +457,46 @@ class AssistanceWorkerTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class SessionReadOrderTests(unittest.IsolatedAsyncioTestCase):
+    """Review 2026-10-01: no relay call without a bot key."""
+
+    def setUp(self):
+        self.relay = FakeRelay()
+        self.addCleanup(self.relay.stop)
+        self._env_backup = {
+            key: os.environ.get(key)
+            for key in ("BUNNY_SPACE_BOT_KEY", "BUNNY_SPACE_SLUG", "BUNNY_SPACE_BASE_URL")
+        }
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    async def test_session_is_not_requested_without_bot_key(self):
+        os.environ["BUNNY_SPACE_BASE_URL"] = self.relay.base_url
+        os.environ.pop("BUNNY_SPACE_BOT_KEY", None)
+        os.environ.pop("BUNNY_SPACE_SLUG", None)
+        config = PlatformConfig(enabled=True, extra={"base_url": self.relay.base_url})
+        adapter = BunnySpaceAdapter(config)
+        adapter._mark_connected()
+        await adapter._load_session()
+        self.assertEqual(
+            self.relay.session_gets,
+            0,
+            "Sin bot key no se debe llamar a /session (evita GET con x-bot-key vacio)",
+        )
+        os.environ["BUNNY_SPACE_BOT_KEY"] = BOT_KEY
+        config2 = PlatformConfig(
+            enabled=True,
+            extra={"bot_key": BOT_KEY, "slug": SLUG, "base_url": self.relay.base_url},
+        )
+        adapter2 = BunnySpaceAdapter(config2)
+        adapter2._mark_connected()
+        await adapter2._load_session()
+        self.assertEqual(self.relay.session_gets, 1, "Con key si se lee la sesion")

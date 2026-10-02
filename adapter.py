@@ -238,6 +238,36 @@ def render_task_payload(
     return rendered, mode
 
 
+#: Maximum size of relay-supplied media downloads (review follow-up 2026-10-01).
+MEDIA_MAX_BYTES = 25 * 1024 * 1024
+
+#: Hosts allowed for relay-supplied media URLs: the configured relay host plus
+#: Bunny Space and Cloudflare R2/Workers domains. Anything else is refused.
+MEDIA_HOST_SUFFIXES = (
+    ".bunny-space.com",
+    ".r2.dev",
+    ".r2.cloudflarestorage.com",
+    ".workers.dev",
+)
+
+
+def _media_host_allowed(host: str, base_url: str) -> bool:
+    """True when a relay-supplied media host is trusted (review 2026-10-01)."""
+    host = (host or "").lower()
+    if not host:
+        return False
+    try:
+        base_host = (urllib.parse.urlparse(base_url or "").hostname or "").lower()
+    except ValueError:
+        base_host = ""
+    if base_host and host == base_host:
+        return True
+    for suffix in MEDIA_HOST_SUFFIXES:
+        if host == suffix.lstrip(".") or host.endswith(suffix):
+            return True
+    return False
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -274,7 +304,7 @@ def _parse_assistance_override(raw: Any) -> Optional[bool]:
     if text in _ASSISTANCE_OFF:
         return False
     logger.warning(
-        "BUNNY_SPACE: BUNNY_SPACE_ASSISTANCE=%r no es 0/1; se trata como 0 (fail-closed)", raw
+        "BUNNY_SPACE: BUNNY_SPACE_ASSISTANCE=%r is not 0/1; treating as 0 (fail-closed)", raw
     )
     return False
 
@@ -326,14 +356,14 @@ def _evaluate_isolation(
     Fail-closed: toda duda deniega. Devuelve ``(allowed, reason)``.
     """
     if not isinstance(config, dict):
-        return False, "configuración ilegible"
+        return False, "unreadable config"
 
     entries = config.get("platform_toolsets")
     if not isinstance(entries, dict):
-        return False, "falta `platform_toolsets` en el config del perfil"
+        return False, "missing `platform_toolsets` in the profile config"
     raw = entries.get(platform)
     if not isinstance(raw, list):
-        return False, f"`platform_toolsets.{platform}` no está declarado como lista explícita"
+        return False, f"`platform_toolsets.{platform}` is not declared as an explicit list"
 
     # Check the toolset the agent REALLY gets on this platform, not just the
     # declared names: Hermes adds every enabled MCP server (unless `no_mcp` is
@@ -344,28 +374,28 @@ def _evaluate_isolation(
 
         names = sorted(_get_platform_tools(config, platform))
     except Exception:  # noqa: BLE001 — cannot prove isolation without the resolver
-        return False, "no se pudo resolver el toolset efectivo de la plataforma"
+        return False, "could not resolve the platform's effective toolset"
     if not names:
         # Explicit empty list == no tools at all for this platform (most isolated).
-        return True, "sin herramientas declaradas para esta plataforma"
+        return True, "no tools declared for this platform"
 
     resolved: set = set()
     for name in names:
         try:
             tools = resolve_toolset(name)
         except Exception:  # noqa: BLE001
-            return False, f"el toolset `{name}` no se pudo resolver"
+            return False, f"toolset `{name}` could not be resolved"
         if not tools:
             return False, (
-                f"el toolset `{name}` no resuelve a ninguna herramienta conocida "
-                "(¿servidor MCP? añade `no_mcp` a la lista)"
+                f"toolset `{name}` does not resolve to any known tool "
+                "(MCP server? add `no_mcp` to the list)"
             )
         resolved.update(tools)
 
     outside = sorted(resolved - allowed)
     if outside:
-        return False, "herramientas fuera del conjunto aislado: " + ", ".join(outside)
-    return True, "solo herramientas de solo lectura: " + ", ".join(sorted(resolved))
+        return False, "tools outside the isolated set: " + ", ".join(outside)
+    return True, "read-only tools only: " + ", ".join(sorted(resolved))
 
 
 def evaluate_assistance_isolation(config: Dict[str, Any], platform: str = ASSISTANCE_PLATFORM) -> Tuple[bool, str]:
@@ -453,6 +483,9 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         # tarea PENDING en cada poll (causaba el "↪ Redirected current run").
         self._inflight_tasks: set[str] = set()
 
+        #: Temp files downloaded for vision (deleted on age or disconnect).
+        self._temp_media_paths: list[str] = []
+
         # Asistencia privada: opt-in del dueño del perfil. `BUNNY_SPACE_ASSISTANCE=1`
         # la enciende; ausente o 0 = apagada, aunque el relé declare la
         # capability en su sesión (`GET /api/bot/v1/session`).
@@ -462,7 +495,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             _get_scoped_secret("BUNNY_SPACE_ASSISTANCE") or extra.get("assistance")
         )
         self.session_assistance_capable = False
-        self.session_reason = "sesión del relé no leída"
+        self.session_reason = "relay session not read"
         self.provision_digest = ""
         self.assistance_requested = False  # se resuelve tras leer la sesión
         self.signature_secret: Optional[str] = None
@@ -506,7 +539,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         if not self.base_url or not self.bot_key or not self.slug:
             logger.error(
                 "BUNNY_SPACE: base_url / bot_key / slug must be configured "
-                "(o el relé debe servir GET /api/bot/v1/session con `bot.slug`)"
+                "(or the relay must serve GET /api/bot/v1/session with `bot.slug`)"
             )
             self._set_fatal_error(
                 "config_missing",
@@ -532,6 +565,12 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 renewer.cancel()
         self._assistance_renewers.clear()
         self._assistance.clear()
+        for path in list(self._temp_media_paths):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._temp_media_paths.clear()
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -552,16 +591,22 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         o el contrato no es `BOT_PROVISION_V1`, o un campo viene mal formado, se
         CONSERVA el comportamiento por `.env` — nunca se adivina.
         """
+        if not self.bot_key or not self.base_url:
+            # Review 2026-10-01: never fire the provisioning call with an
+            # empty x-bot-key; connect() reports the missing config right after.
+            self.session_reason = "relay session not read (no bot key configured)"
+            self.session_assistance_capable = False
+            return
         data = await self._relay_json("GET", "/api/bot/v1/session")
         if not isinstance(data, dict) or data.get("error"):
             error = data.get("error") if isinstance(data, dict) else None
-            self.session_reason = f"sin sesión del relé ({error or 'respuesta ilegible'}); se conserva el .env"
+            self.session_reason = f"no relay session ({error or 'unreadable response'}); keeping .env values"
             logger.info("BUNNY_SPACE: %s", self.session_reason)
             return
         if data.get("contractVersion") != PROVISION_CONTRACT_VERSION:
             self.session_reason = (
-                f"contrato de sesión no reconocido ({data.get('contractVersion')!r}); "
-                "se conserva el .env"
+                f"unrecognized session contract ({data.get('contractVersion')!r}); "
+                "keeping .env values"
             )
             logger.warning("BUNNY_SPACE: %s", self.session_reason)
             return
@@ -570,7 +615,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             canonical = (bot.get("slug") or "").strip()
             if canonical and canonical != self.slug:
                 logger.info(
-                    "BUNNY_SPACE: slug del .env %r → canónico %r (sesión del relé)",
+                    "BUNNY_SPACE: env slug %r → canonical %r (relay session)",
                     self.slug,
                     canonical,
                 )
@@ -593,7 +638,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             secret = signature.get("secret")
             if algorithm and algorithm != SIGNATURE_ALGORITHM:
                 logger.warning(
-                    "BUNNY_SPACE: algoritmo de firma %r desconocido; se ignora el bloque",
+                    "BUNNY_SPACE: unknown signature algorithm %r; ignoring the block",
                     algorithm,
                 )
             elif isinstance(secret, str) and secret:
@@ -606,13 +651,13 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 if isinstance(sig_header, str) and sig_header:
                     self.signature_header = sig_header
                 logger.info(
-                    "BUNNY_SPACE: firma del relé adoptada (required=%s)",
+                    "BUNNY_SPACE: relay signature adopted (required=%s)",
                     self.signature_required,
                 )
         self.session_reason = (
-            f"capability {ASSISTANCE_CAPABILITY} declarada por el relé"
+            f"capability {ASSISTANCE_CAPABILITY} declared by the relay"
             if self.session_assistance_capable
-            else "el relé no declaró la capability de asistencia"
+            else "the relay did not declare the assistance capability"
         )
 
     def _evaluate_assistance(self) -> None:
@@ -624,29 +669,29 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             self.assistance_enabled = False
             if self.assistance_override is False:
                 self.assistance_reason = (
-                    "deshabilitada (override del dueño: BUNNY_SPACE_ASSISTANCE=0)"
+                    "disabled (owner override: BUNNY_SPACE_ASSISTANCE=0)"
                 )
             else:
                 self.assistance_reason = (
-                    f"deshabilitada (opt-in: BUNNY_SPACE_ASSISTANCE=1; {self.session_reason})"
+                    f"disabled (opt-in: BUNNY_SPACE_ASSISTANCE=1; {self.session_reason})"
                 )
             return
         try:
             config = load_active_profile_config()
         except Exception as exc:  # noqa: BLE001 — unreadable config means "not proven"
             self.assistance_enabled = False
-            self.assistance_reason = f"no se pudo leer el config del perfil: {exc}"
-            logger.error("BUNNY_SPACE: asistencia NO habilitada — %s", self.assistance_reason)
+            self.assistance_reason = f"could not read the profile config: {exc}"
+            logger.error("BUNNY_SPACE: assistance NOT enabled — %s", self.assistance_reason)
             return
         allowed, reason = evaluate_assistance_isolation(config)
         self.assistance_enabled = allowed
         self.assistance_reason = reason
         if allowed:
-            logger.info("BUNNY_SPACE: asistencia aislada habilitada (%s)", reason)
+            logger.info("BUNNY_SPACE: isolated assistance enabled (%s)", reason)
         else:
             logger.error(
-                "BUNNY_SPACE: asistencia NO habilitada — %s. Declara `platform_toolsets.%s` "
-                "en el config del perfil (p. ej. []) para habilitar el asistente aislado.",
+                "BUNNY_SPACE: assistance NOT enabled — %s. Declare `platform_toolsets.%s` "
+                "in the profile config (e.g. []) to enable the isolated assistant.",
                 reason,
                 ASSISTANCE_PLATFORM,
             )
@@ -663,9 +708,9 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             config = load_active_profile_config()
         except Exception as exc:  # noqa: BLE001 — config ilegible == no probado
             self.content_isolation_ok = False
-            self.content_isolation_reason = f"no se pudo leer el config del perfil: {exc}"
+            self.content_isolation_reason = f"could not read the profile config: {exc}"
             logger.error(
-                "BUNNY_SPACE: contenido de terceros NO habilitado — %s",
+                "BUNNY_SPACE: third-party content NOT enabled — %s",
                 self.content_isolation_reason,
             )
             return
@@ -673,12 +718,12 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         self.content_isolation_ok = allowed
         self.content_isolation_reason = reason
         if allowed:
-            logger.info("BUNNY_SPACE: frontera de contenido habilitada (%s)", reason)
+            logger.info("BUNNY_SPACE: content boundary enabled (%s)", reason)
         else:
             logger.error(
-                "BUNNY_SPACE: frontera de contenido NO habilitada — %s. Declara "
-                "`platform_toolsets.%s` (p. ej. `[vision]`) para recibir contenido de terceros; "
-                "mientras tanto las tareas @bot NO se despachan.",
+                "BUNNY_SPACE: content boundary NOT enabled — %s. Declare "
+                "`platform_toolsets.%s` (e.g. `[vision]`) to receive third-party content; "
+                "until then @bot tasks are NOT dispatched.",
                 reason,
                 ASSISTANCE_PLATFORM,
             )
@@ -721,7 +766,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 chat_id=f"room:{room_id}",
                 chat_type="group",
                 user_id=msg.get("senderUserId") or "owner",
-                user_name=msg.get("senderName") or "Tú",
+                user_name=msg.get("senderName") or "You",
             )
 
         # 2) Tasks (bot invoked via @bot:<slug> in a post/comment). La puerta de
@@ -746,8 +791,8 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             if not self._content_gate_logged:
                 self._content_gate_logged = True
                 logger.error(
-                    "BUNNY_SPACE: hay tareas @bot pendientes pero el contenido de terceros está "
-                    "BLOQUEADO por la puerta de aislamiento (%s); no se despachan.",
+                    "BUNNY_SPACE: pending @bot tasks but third-party content is "
+                    "BLOCKED by the isolation gate (%s); not dispatching.",
                     self.content_isolation_reason,
                 )
             return
@@ -776,20 +821,20 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 # El relé dice que envolvió el contenido pero las marcas no cuadran:
                 # no se adivina, no se despacha.
                 logger.error(
-                    "BUNNY_SPACE: la tarea %s declara la frontera %s pero las marcas no están "
-                    "balanceadas; no se despacha (fail-closed).",
+                    "BUNNY_SPACE: task %s declares boundary %s but the markers are not "
+                    "balanced; not dispatching (fail-closed).",
                     task_id,
                     boundary_version,
                 )
                 continue
             if not declared:
                 logger.warning(
-                    "BUNNY_SPACE: la tarea %s NO declara la frontera; se envuelve entera como dato.",
+                    "BUNNY_SPACE: task %s does NOT declare the boundary; wrapping it entirely as data.",
                     task_id,
                 )
             rendered, mode = render_task_payload(input_text, boundary_version)
             logger.info(
-                "BUNNY_SPACE: tarea %s despachada con frontera en modo `%s` (%d chars)",
+                "BUNNY_SPACE: task %s dispatched with boundary in `%s` mode (%d chars)",
                 task_id,
                 mode,
                 len(rendered),
@@ -800,7 +845,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 chat_id=f"task:{task_id}",
                 chat_type="dm",
                 user_id="owner",
-                user_name="Tú",
+                user_name="You",
                 media_url=(t.get("mediaUrl") or "").strip() or None,
                 media_note=True,
             )
@@ -826,14 +871,14 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         if task_id in self._assistance:
             return  # ya despachada; el renovador mantiene el lease vivo
         if not isinstance(lease, dict) or not isinstance(lease.get("token"), str) or not lease.get("token"):
-            logger.warning("BUNNY_SPACE: tarea de asistencia %s sin lease utilizable; no se despacha", task_id)
+            logger.warning("BUNNY_SPACE: assistance task %s has no usable lease; not dispatching", task_id)
             return
         if purpose not in (ASSISTANCE_PURPOSE_POST_REVIEW, ASSISTANCE_PURPOSE_THEME_ADVICE):
-            logger.warning("BUNNY_SPACE: tarea de asistencia %s con propósito desconocido; no se despacha", task_id)
+            logger.warning("BUNNY_SPACE: assistance task %s has an unknown purpose; not dispatching", task_id)
             return
         if not isinstance(source_ref, str) or not source_ref or not isinstance(source_version, str) or not source_version:
             # Sin binding completo el resultado nunca podría validarse: no se consume el lease.
-            logger.warning("BUNNY_SPACE: tarea de asistencia %s sin binding (sourceRef/sourceVersion); no se despacha", task_id)
+            logger.warning("BUNNY_SPACE: assistance task %s is missing its binding (sourceRef/sourceVersion); not dispatching", task_id)
             return
 
         context = data.get("context")
@@ -846,13 +891,13 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             "dispatchedAt": datetime.now(timezone.utc).isoformat(),
         }
         self._assistance_renewers[task_id] = asyncio.create_task(self._renew_loop(task_id))
-        logger.info("BUNNY_SPACE: tarea de asistencia %s (%s) reclamada y despachada", task_id, purpose)
+        logger.info("BUNNY_SPACE: assistance task %s (%s) claimed and dispatched", task_id, purpose)
         await self._dispatch_message(
             text=self._assistance_prompt(task_id, purpose, context),
             chat_id=f"assist:{task_id}",
             chat_type="dm",
             user_id="owner",
-            user_name="Tú",
+            user_name="You",
             media_url=(data.get("mediaUrl") or "").strip() or None,
         )
 
@@ -901,7 +946,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 )
                 if not isinstance(response, dict) or response.get("error"):
                     logger.warning(
-                        "BUNNY_SPACE: renew falló para la tarea %s (%s); se descarta el lease",
+                        "BUNNY_SPACE: renew failed for task %s (%s); dropping the lease",
                         task_id,
                         (response or {}).get("error") if isinstance(response, dict) else response,
                     )
@@ -910,7 +955,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.warning("BUNNY_SPACE: renew interrumpido para %s: %s", task_id, exc)
+            logger.warning("BUNNY_SPACE: renew interrupted for %s: %s", task_id, exc)
 
     def _build_assistance_result(self, record: Dict[str, Any], text: str) -> Optional[Dict[str, Any]]:
         """Build the result envelope the relay validates, or None when unusable."""
@@ -953,7 +998,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                     return None
                 if key not in draft_tokens:
                     # El contrato del servidor rechaza claves inventadas: fallar antes de enviar.
-                    logger.warning("BUNNY_SPACE: el asistente propuso una clave de token desconocida (%s)", key)
+                    logger.warning("BUNNY_SPACE: the assistant proposed an unknown token key (%s)", key)
                     return None
                 cleaned[key] = value
             return {
@@ -970,8 +1015,8 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         record = self._assistance.get(task_id)
         if record is None:
             # Sin lease activo (expirado, renovación rechazada o ya entregado).
-            logger.warning("BUNNY_SPACE: respuesta de asistencia para %s sin lease activo; no se envía", task_id)
-            return SendResult(success=False, error="Sin lease activo para la tarea de asistencia")
+            logger.warning("BUNNY_SPACE: assistance response for %s without an active lease; not sending", task_id)
+            return SendResult(success=False, error="No active lease for the assistance task")
 
         envelope = {**record, "taskId": task_id}
         result = self._build_assistance_result(envelope, text)
@@ -982,10 +1027,10 @@ class BunnySpaceAdapter(BasePlatformAdapter):
 
         if result is None:
             logger.error(
-                "BUNNY_SPACE: la respuesta de la tarea %s no es interpretable; no se envía un resultado falso",
+                "BUNNY_SPACE: task %s's response is not interpretable; not sending a fake result",
                 task_id,
             )
-            return SendResult(success=False, error="Respuesta no interpretable para la tarea de asistencia")
+            return SendResult(success=False, error="Uninterpretable response for the assistance task")
 
         response = await self._relay_json(
             "POST",
@@ -993,9 +1038,9 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             body={"action": "submit", "taskId": task_id, "leaseToken": record["leaseToken"], "result": result},
         )
         if isinstance(response, dict) and response.get("error"):
-            logger.error("BUNNY_SPACE: submit de la tarea %s rechazado: %s", task_id, response["error"])
+            logger.error("BUNNY_SPACE: task %s submit rejected: %s", task_id, response["error"])
             return SendResult(success=False, error=str(response["error"]))
-        logger.info("BUNNY_SPACE: resultado de la tarea %s entregado al relé", task_id)
+        logger.info("BUNNY_SPACE: task %s result delivered to the relay", task_id)
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
     # ── Sending (bot reply through the relay) ─────────────────────────────
@@ -1049,6 +1094,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
     # perfil (bot-connection-state.ts). Se envia cada ~45 s y jamas corta el
     # poll si falla.
     async def _heartbeat_tick(self) -> None:
+        self._cleanup_temp_media()
         now = time.monotonic()
         if now - getattr(self, "_last_heartbeat_at", 0.0) < 45.0:
             return
@@ -1068,7 +1114,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             {"botProfileId": bot_id, "status": "AWAKE"},
         )
         if isinstance(result, dict) and result.get("error"):
-            logger.warning("BUNNY_SPACE: heartbeat fallo: %s", result.get("error"))
+            logger.warning("BUNNY_SPACE: heartbeat failed: %s", result.get("error"))
 
     def _learn_bot_profile_id(self, payload) -> None:
         if getattr(self, "bot_profile_id", None):
@@ -1147,7 +1193,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 if now_mono - getattr(self, "_last_signature_recovery", 0.0) >= 30.0:
                     self._last_signature_recovery = now_mono
                     logger.warning(
-                        "BUNNY_SPACE: firma rechazada por el relé (%s); re-leyendo la sesión",
+                        "BUNNY_SPACE: relay rejected the signature (%s); re-reading the session",
                         result.get("reason"),
                     )
                     await self._load_session()
@@ -1214,20 +1260,60 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     async def _download_media(self, url: str) -> Optional[str]:
-        """Descarga una imagen a un archivo temporal (en un hilo)."""
+        """Download relay-supplied media to a temp file (in a worker thread)."""
         try:
-            return await asyncio.to_thread(self._download_media_sync, url)
+            path = await asyncio.to_thread(self._download_media_sync, url)
         except Exception as exc:  # noqa: BLE001
             logger.warning("BUNNY_SPACE: media download failed: %s", exc)
             return None
+        if path:
+            self._temp_media_paths.append(path)
+        return path
+
+    def _cleanup_temp_media(self, max_age_seconds: float = 900.0) -> None:
+        """Delete downloaded media older than max_age_seconds (review 2026-10-01)."""
+        now = time.time()
+        for path in list(self._temp_media_paths):
+            try:
+                expired = now - os.path.getmtime(path) >= max_age_seconds
+            except OSError:
+                expired = True
+            if not expired:
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            self._temp_media_paths.remove(path)
 
     def _download_media_sync(self, url: str) -> Optional[str]:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https":
+            logger.warning("BUNNY_SPACE: media download refused: non-https URL")
+            return None
+        if not _media_host_allowed(parsed.hostname or "", self.base_url):
+            logger.warning("BUNNY_SPACE: media download refused: host not allowed")
+            return None
         req = urllib.request.Request(url, method="GET")
         req.add_header("Accept", "image/*")
         req.add_header("User-Agent", CONNECTOR_USER_AGENT)
         with urllib.request.urlopen(req, timeout=25) as resp:
-            data = resp.read()
             content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            chunks = []
+            total = 0
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MEDIA_MAX_BYTES:
+                    logger.warning(
+                        "BUNNY_SPACE: media download refused: larger than %d bytes",
+                        MEDIA_MAX_BYTES,
+                    )
+                    return None
+                chunks.append(chunk)
+            data = b"".join(chunks)
         ext = {
             "image/png": ".png",
             "image/jpeg": ".jpg",

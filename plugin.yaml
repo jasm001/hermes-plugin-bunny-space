@@ -1,7 +1,7 @@
 name: bunny_space-platform
 label: Bunny Space
 kind: platform
-version: 1.0.4
+version: 1.0.5
 description: >
   Bunny Space gateway adapter for Hermes Agent. Connects a Hermes profile (the
   bot brain) to the Bunny Space relay so the bot joins private rooms and
