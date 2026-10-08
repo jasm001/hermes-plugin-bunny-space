@@ -75,6 +75,18 @@ def _next_poll_backoff_ms(current_ms: int, poll_ms: int, cap_ms: int = 300_000) 
     return min(base * 2, tope)
 
 
+def _effective_poll_ms(configured_ms: int, hint_ms) -> int:
+    """Intervalo efectivo: el SERVIDOR gobierna la cadencia, pero no acelera por
+    debajo de lo configurado en el perfil (max). Hint ausente/invalido -> configurado."""
+    try:
+        hint = int(hint_ms)
+    except (TypeError, ValueError):
+        return int(configured_ms)
+    if hint <= 0:
+        return int(configured_ms)
+    return max(int(configured_ms), hint)
+
+
 logger = logging.getLogger(__name__)
 
 from gateway.platforms.base import (
@@ -480,9 +492,12 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         self.bot_key = _get_scoped_secret("BUNNY_SPACE_BOT_KEY") or extra.get("bot_key", "")
         self.slug = _get_scoped_secret("BUNNY_SPACE_SLUG") or extra.get("slug", "")
         try:
-            self.poll_ms = int(_get_scoped_secret("BUNNY_SPACE_POLL_MS") or extra.get("poll_ms", 3000))
+            self.poll_ms = int(_get_scoped_secret("BUNNY_SPACE_POLL_MS") or extra.get("poll_ms", 15000))
         except (TypeError, ValueError):
-            self.poll_ms = 3000
+            self.poll_ms = 15000
+        # Valor CONFIGURADO del perfil: el hint del servidor nunca lo acelera;
+        # solo puede pedir un ritmo mas lento (max configurado/hint).
+        self._poll_ms_configured = self.poll_ms
 
         # per-room cursor: only process messages newer than this on first connect
         self._cursor = datetime.now(timezone.utc).isoformat()
@@ -637,6 +652,14 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         digest = data.get("provisionDigest")
         if isinstance(digest, str) and digest:
             self.provision_digest = digest
+        # Cadencia gobernada por el SERVIDOR: el hint de la sesion manda, pero
+        # nunca acelera por debajo de lo configurado en el perfil.
+        hint = data.get("pollIntervalMs")
+        if isinstance(hint, (int, float)) and not isinstance(hint, bool) and hint > 0:
+            effective = _effective_poll_ms(getattr(self, "_poll_ms_configured", self.poll_ms), hint)
+            if effective != self.poll_ms:
+                logger.info("BUNNY_SPACE: poll interval -> %sms (relay suggests %sms)", effective, int(hint))
+            self.poll_ms = effective
         # La sesión es la fuente del secreto de firma: se re-sincroniza SIEMPRE
         # (si el dueño rotó o quitó el secreto, el conector se entera aquí).
         self.signature_secret = None
