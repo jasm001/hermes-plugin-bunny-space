@@ -76,15 +76,26 @@ def _next_poll_backoff_ms(current_ms: int, poll_ms: int, cap_ms: int = 300_000) 
 
 
 def _effective_poll_ms(configured_ms: int, hint_ms) -> int:
-    """Intervalo efectivo: el SERVIDOR gobierna la cadencia, pero no acelera por
-    debajo de lo configurado en el perfil (max). Hint ausente/invalido -> configurado."""
+    """Intervalo efectivo: el SERVIDOR es AUTORITATIVO (carril `presencia-cadencia`).
+    Con hint valido manda el hint — puede acelerar (10 s con el dueno activo) o
+    frenar (15 min cuando descansa); sin hint valido, la config del perfil."""
     try:
         hint = int(hint_ms)
     except (TypeError, ValueError):
         return int(configured_ms)
     if hint <= 0:
         return int(configured_ms)
-    return max(int(configured_ms), hint)
+    return hint
+
+
+def _should_refresh_session(poll_ms: int, cycle: int, fast_every: int = 30) -> bool:
+    """¿Toca re-leer `/session` ANTES de este ciclo? La cadencia ahora CAMBIA con
+    la presencia del dueno: en modo lento (>60 s) se re-lee en CADA ciclo — es lo
+    que despierta al bot cuando el dueno vuelve; en modo rapido, cada `fast_every`
+    ciclos (~5 min a 10 s) para notar que se fue, sin coste apreciable."""
+    if int(poll_ms) > 60_000:
+        return True
+    return int(cycle) > 0 and int(cycle) % int(fast_every) == 0
 
 
 logger = logging.getLogger(__name__)
@@ -768,6 +779,15 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         while self.is_connected:
             failed = False
             failures_before = getattr(self, "_relay_failures", 0)
+            self._poll_cycles = getattr(self, "_poll_cycles", 0) + 1
+            if _should_refresh_session(self.poll_ms, self._poll_cycles):
+                # Cadencia gobernada por el SERVIDOR (presencia del dueno): re-leer
+                # la sesion para adoptar el hint vigente. Un fallo no cambia nada:
+                # los fallos de red ya alimentan el retroceso como cualquier ciclo.
+                try:
+                    await self._load_session()
+                except Exception as e:
+                    logger.warning("BUNNY_SPACE: refresco de sesion fallo: %s", e)
             try:
                 await self._poll_once()
                 await self._heartbeat_tick()

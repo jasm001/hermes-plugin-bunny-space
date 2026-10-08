@@ -10,7 +10,11 @@ if str(PLUGIN_DIR.parent) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR.parent))
 
 import bunny_space.adapter as adapter_module  # noqa: E402
-from bunny_space.adapter import _effective_poll_ms, _next_poll_backoff_ms  # noqa: E402
+from bunny_space.adapter import (  # noqa: E402
+    _effective_poll_ms,
+    _next_poll_backoff_ms,
+    _should_refresh_session,
+)
 
 
 class PollBackoffTests(unittest.TestCase):
@@ -30,14 +34,28 @@ class PollBackoffTests(unittest.TestCase):
 
 
 class PollIntervalTests(unittest.TestCase):
-    def test_el_servidor_no_acelera_por_debajo_de_lo_configurado(self):
-        # hint mas lento que lo configurado: manda el hint
-        self.assertEqual(_effective_poll_ms(3000, 45000), 45000)
-        # hint mas rapido: no acelera; se queda en lo configurado
-        self.assertEqual(_effective_poll_ms(30000, 1000), 30000)
+    def test_el_servidor_es_autoritativo_en_ambos_sentidos(self):
+        # hint mas lento (descansando): manda el hint
+        self.assertEqual(_effective_poll_ms(3000, 900000), 900000)
+        # hint mas rapido (dueno activo -> 10 s): manda el hint
+        self.assertEqual(_effective_poll_ms(30000, 10000), 10000)
         # sin hint o basura: configurado
         self.assertEqual(_effective_poll_ms(15000, None), 15000)
         self.assertEqual(_effective_poll_ms(15000, "abc"), 15000)
+        self.assertEqual(_effective_poll_ms(15000, 0), 15000)
+
+    def test_refresco_de_sesion_por_modo(self):
+        # Modo lento: SIEMPRE antes de cada ciclo (es el despertador del bot)
+        self.assertTrue(_should_refresh_session(180000, 1))
+        self.assertTrue(_should_refresh_session(900000, 7))
+        # Modo rapido: cada 30 ciclos
+        self.assertFalse(_should_refresh_session(10000, 1))
+        self.assertFalse(_should_refresh_session(10000, 29))
+        self.assertTrue(_should_refresh_session(10000, 30))
+        self.assertTrue(_should_refresh_session(10000, 60))
+        # Frontera: 60 s exactos aun es "rapido"; por encima ya es lento
+        self.assertFalse(_should_refresh_session(60000, 1))
+        self.assertTrue(_should_refresh_session(61000, 1))
 
 class PollIntervalHintTests(unittest.IsolatedAsyncioTestCase):
     async def test_load_session_adopta_el_hint_del_servidor(self):
@@ -67,7 +85,8 @@ class PollIntervalHintTests(unittest.IsolatedAsyncioTestCase):
 
         adapter._relay_json = relay_fast
         await adapter._load_session()
-        self.assertEqual(adapter.poll_ms, 30000)
+        # Autoritativo en ambos sentidos: un hint mas rapido (dueno activo) ACELERA.
+        self.assertEqual(adapter.poll_ms, 1000)
 
 if __name__ == "__main__":
     unittest.main()
