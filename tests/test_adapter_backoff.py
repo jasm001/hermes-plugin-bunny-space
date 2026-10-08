@@ -90,3 +90,37 @@ class PollIntervalHintTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class StreamTicketTests(unittest.IsolatedAsyncioTestCase):
+    async def test_load_session_adopta_el_ticket_del_stream(self):
+        adapter = adapter_module.BunnySpaceAdapter.__new__(adapter_module.BunnySpaceAdapter)
+        adapter.bot_key = "bt_x"
+        adapter.base_url = "http://127.0.0.1:9"
+        adapter.slug = "Luna"
+        adapter.poll_ms = 15000
+        adapter._poll_ms_configured = 15000
+        adapter.session_reason = ""
+        adapter.session_assistance_capable = False
+        adapter.provision_digest = None
+        adapter.signature_secret = None
+        adapter.signature_required = False
+        adapter.signature_timestamp_header = "x-bot-timestamp"
+        adapter.signature_header = "x-bot-signature"
+        adapter.stream_url = ""
+        adapter.stream_token = ""
+
+        async def relay_ok(method, path, body=None):
+            return {"contractVersion": "BOT_PROVISION_V1", "stream": {"url": "wss://s/ws?bot=b1", "token": "t.t"}}
+
+        adapter._relay_json = relay_ok
+        await adapter._load_session()
+        self.assertEqual(adapter.stream_url, "wss://s/ws?bot=b1")
+        self.assertEqual(adapter.stream_token, "t.t")
+
+        async def relay_bad(method, path, body=None):
+            return {"contractVersion": "BOT_PROVISION_V1", "stream": {"url": "wss://s/ws?bot=b1"}}
+
+        adapter._relay_json = relay_bad
+        await adapter._load_session()
+        # Malformado (sin token): se conserva lo anterior, no se rompe.
+        self.assertEqual(adapter.stream_token, "t.t")

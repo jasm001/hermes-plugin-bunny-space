@@ -506,8 +506,9 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             self.poll_ms = int(_get_scoped_secret("BUNNY_SPACE_POLL_MS") or extra.get("poll_ms", 15000))
         except (TypeError, ValueError):
             self.poll_ms = 15000
-        # Valor CONFIGURADO del perfil: el hint del servidor nunca lo acelera;
-        # solo puede pedir un ritmo mas lento (max configurado/hint).
+        # Valor configurado del perfil: FALLBACK cuando el servidor no manda
+        # hint (con hint valido, el servidor es autoritativo — carril
+        # `presencia-cadencia`: 10 s activo / 3 min / 15 min descansando).
         self._poll_ms_configured = self.poll_ms
 
         # per-room cursor: only process messages newer than this on first connect
@@ -532,6 +533,9 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         self.session_assistance_capable = False
         self.session_reason = "relay session not read"
         self.provision_digest = ""
+        # Carril `bot-stream`: WS de avisos (ticket viene de la sesion).
+        self.stream_url = ""
+        self.stream_token = ""
         self.assistance_requested = False  # se resuelve tras leer la sesión
         self.signature_secret: Optional[str] = None
         self.signature_required = False
@@ -671,6 +675,15 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             if effective != self.poll_ms:
                 logger.info("BUNNY_SPACE: poll interval -> %sms (relay suggests %sms)", effective, int(hint))
             self.poll_ms = effective
+        # Ticket del stream (carril `bot-stream`): URL + token HMAC. Ausente o
+        # malformado -> se conserva lo anterior (el latido es la red de seguridad).
+        stream = data.get("stream")
+        if isinstance(stream, dict):
+            url = stream.get("url")
+            token = stream.get("token")
+            if isinstance(url, str) and url and isinstance(token, str) and token:
+                self.stream_url = url
+                self.stream_token = token
         # La sesión es la fuente del secreto de firma: se re-sincroniza SIEMPRE
         # (si el dueño rotó o quitó el secreto, el conector se entera aquí).
         self.signature_secret = None
@@ -776,6 +789,10 @@ class BunnySpaceAdapter(BasePlatformAdapter):
     async def _poll_loop(self) -> None:
         logger.info("BUNNY_SPACE: bucle de poll (retroceso exponencial hasta 5 min)")
         backoff_ms = self.poll_ms
+        self._wake = asyncio.Event()
+        existing = getattr(self, "_stream_task", None)
+        if existing is None or existing.done():
+            self._stream_task = asyncio.create_task(self._stream_loop())
         while self.is_connected:
             failed = False
             failures_before = getattr(self, "_relay_failures", 0)
@@ -803,7 +820,51 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 logger.info("BUNNY_SPACE: retroceso activo; siguiente intento en %sms", backoff_ms)
             else:
                 backoff_ms = self.poll_ms
-            await asyncio.sleep(backoff_ms / 1000)
+            # Dormir el ciclo — pero un aviso del stream lo despierta al
+            # instante (carril `bot-stream`). El latido normal (backoff_ms)
+            # queda como red de seguridad si el stream no esta o se cae.
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=backoff_ms / 1000)
+                self._wake.clear()
+            except asyncio.TimeoutError:
+                pass
+
+    async def _stream_loop(self) -> None:
+        """Canal de avisos del relé (carril `bot-stream`): un WebSocket al worker
+        de stream; cada mensaje despierta el ciclo de poll al instante. Si el
+        stream no está disponible, el latido normal hace el trabajo igual."""
+        try:
+            import websockets
+        except Exception:
+            logger.info("BUNNY_SPACE: stream no disponible (falta websockets); solo latido")
+            return
+        retry_seconds = 5.0
+        while self.is_connected:
+            url = getattr(self, "stream_url", "")
+            token = getattr(self, "stream_token", "")
+            if not url or not token:
+                await asyncio.sleep(15)
+                continue
+            try:
+                sep = "&" if "?" in url else "?"
+                full = f"{url}{sep}token={token}"
+                async with websockets.connect(full, open_timeout=10, ping_interval=30) as ws:
+                    logger.info("BUNNY_SPACE: stream conectado; los avisos despiertan el poll")
+                    retry_seconds = 5.0
+                    async for _message in ws:
+                        self._wake.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.info(
+                    "BUNNY_SPACE: stream desconectado (%s); reintento en %ss",
+                    type(e).__name__,
+                    int(retry_seconds),
+                )
+            if not self.is_connected:
+                return
+            await asyncio.sleep(retry_seconds)
+            retry_seconds = min(retry_seconds * 2, 60.0)
 
     async def _poll_once(self) -> None:
         # 1) Room messages addressed to this bot (owner posts in a room).
