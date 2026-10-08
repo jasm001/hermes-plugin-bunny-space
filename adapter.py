@@ -66,6 +66,15 @@ def _get_scoped_secret(name, default=None, external_fallback=False):
         name, default, external_fallback=external_fallback)
 
 
+def _next_poll_backoff_ms(current_ms: int, poll_ms: int, cap_ms: int = 300_000) -> int:
+    """Retroceso del bucle de poll ante fallo: dobla por fallo consecutivo,
+    nunca por debajo del poll_ms y con techo (5 min por defecto). Un exito
+    lo resetea (el bucle vuelve a self.poll_ms)."""
+    base = max(int(current_ms), int(poll_ms))
+    tope = max(int(cap_ms), int(poll_ms))
+    return min(base * 2, tope)
+
+
 logger = logging.getLogger(__name__)
 
 from gateway.platforms.base import (
@@ -731,13 +740,27 @@ class BunnySpaceAdapter(BasePlatformAdapter):
     # ── Polling loop (outbound pull from the relay) ───────────────────────
 
     async def _poll_loop(self) -> None:
+        logger.info("BUNNY_SPACE: bucle de poll (retroceso exponencial hasta 5 min)")
+        backoff_ms = self.poll_ms
         while self.is_connected:
+            failed = False
+            failures_before = getattr(self, "_relay_failures", 0)
             try:
                 await self._poll_once()
                 await self._heartbeat_tick()
             except Exception as e:
+                failed = True
                 logger.warning("BUNNY_SPACE: poll error: %s", e)
-            await asyncio.sleep(self.poll_ms / 1000)
+            if getattr(self, "_relay_failures", 0) > failures_before:
+                failed = True
+            if failed:
+                # Rele caido (p. ej. servidor local apagado): retroceso
+                # exponencial hasta 5 min en vez de martillar en cada ciclo.
+                backoff_ms = _next_poll_backoff_ms(backoff_ms, self.poll_ms)
+                logger.info("BUNNY_SPACE: retroceso activo; siguiente intento en %sms", backoff_ms)
+            else:
+                backoff_ms = self.poll_ms
+            await asyncio.sleep(backoff_ms / 1000)
 
     async def _poll_once(self) -> None:
         # 1) Room messages addressed to this bot (owner posts in a room).
@@ -1201,6 +1224,10 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             return result
         except Exception as e:
             logger.warning("BUNNY_SPACE: relay %s %s failed: %s", method, path, e)
+            # Senal para el bucle de poll: un fallo de RED de este ciclo alimenta
+            # el retroceso exponencial (el error se devuelve como dict, asi que
+            # no hay excepcion que el bucle pueda ver).
+            self._relay_failures = getattr(self, "_relay_failures", 0) + 1
             return {"error": str(e)}
 
     # ── Inbound dispatch ──────────────────────────────────────────────────
