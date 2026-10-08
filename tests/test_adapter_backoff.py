@@ -14,6 +14,7 @@ from bunny_space.adapter import (  # noqa: E402
     _effective_poll_ms,
     _next_poll_backoff_ms,
     _should_refresh_session,
+    _stream_ws_url,
 )
 
 
@@ -124,3 +125,21 @@ class StreamTicketTests(unittest.IsolatedAsyncioTestCase):
         await adapter._load_session()
         # Malformado (sin token): se conserva lo anterior, no se rompe.
         self.assertEqual(adapter.stream_token, "t.t")
+
+class StreamUrlTests(unittest.TestCase):
+    def test_normaliza_esquema_y_anade_token(self):
+        # https -> wss (lo que entrega la sesion) y token con '?'
+        self.assertEqual(
+            _stream_ws_url("https://s.example/ws?bot=b1", "t.t"),
+            "wss://s.example/ws?bot=b1&token=t.t",
+        )
+        # http -> ws, sin query previa
+        self.assertEqual(
+            _stream_ws_url("http://s.example/ws", "t.t"),
+            "ws://s.example/ws?token=t.t",
+        )
+        # wss ya correcta: intacta
+        self.assertEqual(
+            _stream_ws_url("wss://s.example/ws?bot=b1", "t.t"),
+            "wss://s.example/ws?bot=b1&token=t.t",
+        )

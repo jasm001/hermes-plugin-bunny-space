@@ -88,6 +88,18 @@ def _effective_poll_ms(configured_ms: int, hint_ms) -> int:
     return hint
 
 
+def _stream_ws_url(url: str, token: str) -> str:
+    """Normaliza la URL del stream a ws(s):// y le anade el token. La sesion
+    puede entregarla en https (infra compartida): `websockets` exige ws/wss."""
+    base = url
+    if base.startswith("https://"):
+        base = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        base = "ws://" + base[len("http://"):]
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}token={token}"
+
+
 def _should_refresh_session(poll_ms: int, cycle: int, fast_every: int = 30) -> bool:
     """¿Toca re-leer `/session` ANTES de este ciclo? La cadencia ahora CAMBIA con
     la presencia del dueno: en modo lento (>60 s) se re-lee en CADA ciclo — es lo
@@ -846,8 +858,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 await asyncio.sleep(15)
                 continue
             try:
-                sep = "&" if "?" in url else "?"
-                full = f"{url}{sep}token={token}"
+                full = _stream_ws_url(url, token)
                 async with websockets.connect(full, open_timeout=10, ping_interval=30) as ws:
                     logger.info("BUNNY_SPACE: stream conectado; los avisos despiertan el poll")
                     retry_seconds = 5.0
