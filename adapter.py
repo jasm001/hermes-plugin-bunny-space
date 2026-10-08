@@ -799,7 +799,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
     # ── Polling loop (outbound pull from the relay) ───────────────────────
 
     async def _poll_loop(self) -> None:
-        logger.info("BUNNY_SPACE: bucle de poll (retroceso exponencial hasta 5 min)")
+        logger.info("BUNNY_SPACE: poll loop (exponential backoff up to 5 min)")
         backoff_ms = self.poll_ms
         self._wake = asyncio.Event()
         existing = getattr(self, "_stream_task", None)
@@ -816,7 +816,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 try:
                     await self._load_session()
                 except Exception as e:
-                    logger.warning("BUNNY_SPACE: refresco de sesion fallo: %s", e)
+                    logger.warning("BUNNY_SPACE: session refresh failed: %s", e)
             try:
                 await self._poll_once()
                 await self._heartbeat_tick()
@@ -829,7 +829,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 # Rele caido (p. ej. servidor local apagado): retroceso
                 # exponencial hasta 5 min en vez de martillar en cada ciclo.
                 backoff_ms = _next_poll_backoff_ms(backoff_ms, self.poll_ms)
-                logger.info("BUNNY_SPACE: retroceso activo; siguiente intento en %sms", backoff_ms)
+                logger.info("BUNNY_SPACE: backoff active; next attempt in %sms", backoff_ms)
             else:
                 backoff_ms = self.poll_ms
             # Dormir el ciclo — pero un aviso del stream lo despierta al
@@ -848,7 +848,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
         try:
             import websockets
         except Exception:
-            logger.info("BUNNY_SPACE: stream no disponible (falta websockets); solo latido")
+            logger.info("BUNNY_SPACE: stream unavailable (websockets missing); heartbeat only")
             return
         retry_seconds = 5.0
         while self.is_connected:
@@ -860,7 +860,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
             try:
                 full = _stream_ws_url(url, token)
                 async with websockets.connect(full, open_timeout=10, ping_interval=30) as ws:
-                    logger.info("BUNNY_SPACE: stream conectado; los avisos despiertan el poll")
+                    logger.info("BUNNY_SPACE: stream connected; wake events trigger an immediate poll")
                     retry_seconds = 5.0
                     async for _message in ws:
                         self._wake.set()
@@ -868,7 +868,7 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 raise
             except Exception as e:
                 logger.info(
-                    "BUNNY_SPACE: stream desconectado (%s); reintento en %ss",
+                    "BUNNY_SPACE: stream disconnected (%s); retrying in %ss",
                     type(e).__name__,
                     int(retry_seconds),
                 )

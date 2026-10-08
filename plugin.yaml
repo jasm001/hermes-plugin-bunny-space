@@ -1,7 +1,7 @@
 name: bunny_space-platform
 label: Bunny Space
 kind: platform
-version: 1.0.5
+version: 1.0.6
 description: >
   Bunny Space gateway adapter for Hermes Agent. Connects a Hermes profile (the
   bot brain) to the Bunny Space relay so the bot joins private rooms and
@@ -22,8 +22,11 @@ optional_env:
     prompt: "Bunny Space relay URL"
     password: false
   - name: BUNNY_SPACE_POLL_MS
-    description: "Poll interval in milliseconds (default 3000)"
-    prompt: "Poll interval (ms)"
+    description: >-
+      Fallback poll interval in milliseconds when the relay sends no cadence
+      hint (default 15000). The relay governs the live cadence; a task wake
+      stream, when provided, triggers immediate polls.
+    prompt: "Fallback poll interval (ms)"
     password: false
   - name: BUNNY_SPACE_ASSISTANCE
     description: >-
