@@ -42,6 +42,7 @@ No external dependencies beyond the stdlib (urllib via asyncio.to_thread).
 """
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -86,6 +87,20 @@ def _effective_poll_ms(configured_ms: int, hint_ms) -> int:
     if hint <= 0:
         return int(configured_ms)
     return hint
+
+
+def _is_stream_wake(message) -> bool:
+    """A keepalive ``pong`` is NOT a hub event.
+
+    Why it exists (v1.0.7): the keepalive sends ``ping`` every
+    ``STREAM_KEEPALIVE_SECONDS`` and the Durable Object answers ``pong`` from the
+    runtime. If that ACK woke the poll cycle, the instant channel would become one
+    extra poll every 25 s per bot — exactly what the server-governed cadence exists
+    to avoid. Only hub messages wake the cycle.
+    """
+    if isinstance(message, str) and message.strip().lower() == STREAM_KEEPALIVE_ACK:
+        return False
+    return True
 
 
 def _stream_ws_url(url: str, token: str) -> str:
@@ -284,6 +299,14 @@ def render_task_payload(
 
 #: Maximum size of relay-supplied media downloads (review follow-up 2026-10-01).
 MEDIA_MAX_BYTES = 25 * 1024 * 1024
+
+# Application-level stream keepalive (v1.0.7). The Durable Object runtime answers it
+# with "pong" without waking the object (setWebSocketAutoResponse). It replaces the
+# protocol-level ping that `ping_interval=30` used to send, which the runtime also
+# answers but which never reaches our reader as a message.
+STREAM_KEEPALIVE_SECONDS = 25.0
+STREAM_KEEPALIVE_PING = "ping"
+STREAM_KEEPALIVE_ACK = "pong"
 
 #: Hosts allowed for relay-supplied media URLs: the configured relay host plus
 #: Bunny Space and Cloudflare R2/Workers domains. Anything else is refused.
@@ -859,11 +882,23 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 continue
             try:
                 full = _stream_ws_url(url, token)
-                async with websockets.connect(full, open_timeout=10, ping_interval=30) as ws:
+                # ping_interval=None: the application-level ping owns the keepalive
+                # (v1.0.7). Two keepalives would double the traffic and the protocol
+                # one does not surface the ACK to our reader.
+                async with websockets.connect(full, open_timeout=10, ping_interval=None) as ws:
                     logger.info("BUNNY_SPACE: stream connected; wake events trigger an immediate poll")
                     retry_seconds = 5.0
-                    async for _message in ws:
-                        self._wake.set()
+                    keepalive = asyncio.create_task(self._stream_keepalive(ws))
+                    try:
+                        async for message in ws:
+                            # The keepalive ACK is not a hub event (see _is_stream_wake).
+                            if not _is_stream_wake(message):
+                                continue
+                            self._wake.set()
+                    finally:
+                        keepalive.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await keepalive
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -876,6 +911,23 @@ class BunnySpaceAdapter(BasePlatformAdapter):
                 return
             await asyncio.sleep(retry_seconds)
             retry_seconds = min(retry_seconds * 2, 60.0)
+
+    async def _stream_keepalive(self, ws) -> None:
+        """Application-level ping every STREAM_KEEPALIVE_SECONDS (v1.0.7).
+
+        Why it exists: the wake Durable Object is evicted when idle and the socket
+        used to die with 1006 / "this Durable Object instance is no longer active".
+        The application ping keeps the socket alive; because the worker answers
+        `pong` from the runtime, it neither wakes the object nor costs CPU.
+        """
+        try:
+            while True:
+                await asyncio.sleep(STREAM_KEEPALIVE_SECONDS)
+                await ws.send(STREAM_KEEPALIVE_PING)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # the socket reader reports the drop
+            logger.info("BUNNY_SPACE: stream keepalive stopped (%s)", type(e).__name__)
 
     async def _poll_once(self) -> None:
         # 1) Room messages addressed to this bot (owner posts in a room).
